@@ -20,7 +20,7 @@ dill==0.3.7
 distro==1.8.0
 einops==0.7.0
 filelock
-flash-attn==2.3.4
+flash-attn==2.3.4 # FLASH_ATTENTION_FORCE_BUILD=TRUE pip install flash-attn
 frozenlist==1.4.0
 fsspec==2023.10.0
 glog==0.3.1
@@ -108,4 +108,8 @@ urllib3
 xxhash==3.4.1
 yarl==1.9.2
 zstandard==0.22.0
-fast-hadamard-transform
+fast-hadamard-transform # install from repo
+
+packaging
+#pip3 install torch torchvision torchaudio
+

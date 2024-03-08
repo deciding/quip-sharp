@@ -17,6 +17,7 @@ from transformers.modeling_attn_mask_utils import \
     _prepare_4d_causal_attention_mask
 
 from lib import utils
+from .zutil import Queue
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', default=0, type=int)
@@ -31,7 +32,7 @@ parser.add_argument('--scratch_path', default=None, type=str)
 parser.add_argument('--chunk_size', default=256, type=int)
 parser.add_argument('--async_copy_speed', default=-1, type=int)
 parser.add_argument('--act_save_rate', default=4, type=int)
-parser.add_argument('--save_activations', action='store_true')
+parser.add_argument('--save_activations', default=True, action='store_true')
 parser.add_argument('--sample_proc', default=4, type=int)
 
 
@@ -54,9 +55,9 @@ def forward_layer(layer, position_ids, attention_mask, bs, device, in_q,
                   out_q):
     torch.set_grad_enabled(False)
     layer = layer.to(device)
-    position_ids = position_ids.to(device)
-    attention_mask = attention_mask.to(device)
-    done_qkv = utils.register_H_hook(layer.self_attn.q_proj, device)
+    position_ids = position_ids.to(device) # bxL
+    attention_mask = attention_mask.to(device) #bx1xLxL
+    done_qkv = utils.register_H_hook(layer.self_attn.q_proj, device) # release hook, hook is to get H, mean, and count
     done_o = utils.register_H_hook(layer.self_attn.o_proj, device)
     done_up = utils.register_H_hook(layer.mlp.up_proj, device)
     done_down = utils.register_H_hook(layer.mlp.down_proj, device)
@@ -77,7 +78,7 @@ def forward_layer(layer, position_ids, attention_mask, bs, device, in_q,
 
         assert len(dev_emb) % bs == 0
         for i in range(len(dev_emb) // bs):
-            dev_emb[i * bs:(i + 1) * bs] = layer(
+            dev_emb[i * bs:(i + 1) * bs] = layer( # update for the next layer, and accumulate H,mean,cnt, dev_embd [chunk, L, H]
                 dev_emb[i * bs:(i + 1) * bs].to(device),
                 position_ids=position_ids,
                 attention_mask=attention_mask,
@@ -109,11 +110,11 @@ def accumulate(in_q, move_q, ngpus, args, transformer_layer_index):
     for key in Hs:
         mus[key].div_(cts[key])
         Hs[key].div_(cts[key])
-        Hs[key].addmm_(-mus[key].unsqueeze(-1), mus[key].unsqueeze(0))
+        Hs[key].addmm_(-mus[key].unsqueeze(-1), mus[key].unsqueeze(0)) # - mu^T mu, outer product
         save_path = f"{args.scratch_path}/{transformer_layer_index}_{key}.pt" if args.scratch_path is not None else f"{args.save_path}/{transformer_layer_index}_{key}.pt"
         torch.save(
             {
-                'flatH': utils.sym_to_flat(Hs[key].to(torch.float32)),
+                'flatH': utils.sym_to_flat(Hs[key].to(torch.float32)), # flatten the lower triangular part
                 'mu': mus[key].to(torch.float32),
                 'n': Hs[key].shape[0],
                 'ct': cts[key]
@@ -146,11 +147,11 @@ def main(args):
         )
     else:
         print("loading dataset...")
-        devset = utils.sample_rp1t(tokenizer,
+        devset = utils.sample_rp1t(tokenizer, # load data from redpajama, using LlamaTokenizerFast
                                    args.devset_size,
                                    args.ctx_size,
                                    nproc=args.sample_proc)
-        dev_emb = model.model.embed_tokens(devset)
+        dev_emb = model.model.embed_tokens(devset) # 32000 -> h(4096), BxLxH, 6144x4096x4096
         after_layer = -1
         print("loaded dataset!")
 
@@ -158,7 +159,7 @@ def main(args):
     dev_emb.share_memory_()
 
     position_ids = torch.arange(args.ctx_size, dtype=torch.int64)[None, :] + \
-        torch.zeros(args.batch_size, args.ctx_size, dtype=torch.int64)
+        torch.zeros(args.batch_size, args.ctx_size, dtype=torch.int64) # bxL arange, 2x4096
     if hasattr(model.config, 'sliding_window'):
         attention_mask = _prepare_4d_causal_attention_mask(
             None, (args.batch_size, args.ctx_size),
@@ -166,9 +167,9 @@ def main(args):
             0,
             sliding_window=model.config.sliding_window)
     else:
-        attention_mask = _prepare_4d_causal_attention_mask(
-            None, (args.batch_size, args.ctx_size),
-            dev_emb[0:args.batch_size], 0)
+        attention_mask = _prepare_4d_causal_attention_mask( # bx1xqxk
+            None, (args.batch_size, args.ctx_size), # bxL
+            dev_emb[0:args.batch_size], 0) # bxLxH
 
     if args.scratch_path is not None:
         move_q = mp.Queue()
@@ -190,7 +191,7 @@ def main(args):
         assert (len([
             m for m in transformer_layer.modules()
             if isinstance(m, torch.nn.Linear)
-        ]) == 7)
+        ]) == 7) # qkvo gud
 
         chunk_size = min(args.chunk_size, len(dev_emb))
         ngpus = min(torch.cuda.device_count(), len(dev_emb) // chunk_size)
@@ -198,6 +199,19 @@ def main(args):
         manager = mp.get_context('spawn').Manager()
         in_q = manager.Queue()
         out_q = manager.Queue()
+        #in_q = Queue()
+        #out_q = Queue()
+        #i=0
+        #while i < len(dev_emb):
+        #    next = min(i + chunk_size, len(dev_emb))
+        #    in_q.put(dev_emb[i:next])
+        #    i = next
+        #    forward_layer(transformer_layer, position_ids, attention_mask, args.batch_size, 0, in_q, out_q)
+        #    in_q.put(None)
+        #    import pdb;pdb.set_trace()
+        #    forward_layer(transformer_layer, position_ids, attention_mask, args.batch_size, 0, in_q, out_q)
+        #    accumulate(out_q, move_q, 1, args, transformer_layer_index)
+        #import pdb;pdb.set_trace()
 
         accumulate_proc = mp.Process(target=accumulate,
                                      args=(out_q, move_q, ngpus, args,

@@ -16,7 +16,7 @@ def show_metrics(hatW, W_orig, H, msg):
     err_frob = (hatW - W_orig).square().sum() / W_orig.square().sum()
     err_proxy = (((hatW - W_orig) @ H) *
                  (hatW - W_orig)).sum() / ((W_orig @ H) * W_orig).sum()
-    glog.info(f"{msg} frob  error: {err_frob}")
+    glog.info(f"{msg} frob  error: {err_frob}") # frobius norm
     glog.info(f"{msg} proxy error: {err_proxy}")
 
 

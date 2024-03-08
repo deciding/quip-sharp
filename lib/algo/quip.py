@@ -9,7 +9,7 @@ from lib import utils
 
 
 def RHT_H(H, SU):
-    return utils.matmul_hadUt(utils.matmul_hadUt(H * SU).T * SU)
+    return utils.matmul_hadUt(utils.matmul_hadUt(H * SU).T * SU) # H is symmetric
 
 
 def RHT_W(W, SU, SV):
@@ -66,7 +66,7 @@ def incoherence_preprocess(H, W, args):
 
     Wr = Wr.to(device)
 
-    return Lhr, Hr, Wr, SU, SV, scaleWH
+    return Lhr, Hr, Wr, SU, SV, scaleWH # HxH, HxH, H2xH, H, H2, H or None
 
 
 def incoherence_process(hatWr, SU, SV, scaleWH, args):
@@ -174,13 +174,13 @@ def LDLQ_buffered(Wr, Hr, L, D, cb, args, buf_cols=128):
     reduce overhead of memory r/w
     buffer size is in groups of codesz (4) columns (for D4)
     '''
-    (m, n) = Wr.shape
+    (m, n) = Wr.shape # H2, H
     assert buf_cols % cb.codesz == 0
     assert n % buf_cols == 0
-    buf_size = buf_cols // cb.codesz
+    buf_size = buf_cols // cb.codesz # 16
 
-    hatWr_T = torch.zeros(n, m, dtype=Hr.dtype, device=Hr.device)
-    Qidxs_T = torch.zeros(n // cb.codesz,
+    hatWr_T = torch.zeros(n, m, dtype=Hr.dtype, device=Hr.device) # nxm
+    Qidxs_T = torch.zeros(n // cb.codesz, # n/gxm
                           m,
                           dtype=cb.idx_dtype,
                           device=Hr.device)
@@ -193,23 +193,23 @@ def LDLQ_buffered(Wr, Hr, L, D, cb, args, buf_cols=128):
     Hr_T = Hr.T.contiguous().to(device)
 
     # quip
-    prod_cache = torch.zeros(n, m, dtype=Wr_T.dtype, device=Wr_T.device)
-    for cur_col in range(n // cb.codesz, 0, -buf_size):
-        b_Wr_T = Wr_T[cb.codesz * (cur_col - buf_size):cb.codesz * cur_col]
+    prod_cache = torch.zeros(n, m, dtype=Wr_T.dtype, device=Wr_T.device) # nxm
+    for cur_col in range(n // cb.codesz, 0, -buf_size): # 4096/8~0, -128/8, for each buffer 16*8
+        b_Wr_T = Wr_T[cb.codesz * (cur_col - buf_size):cb.codesz * cur_col] # 8*(c-16): 8*c x H2, input
         b_hatWr_T = hatWr_T[cb.codesz * (cur_col - buf_size):cb.codesz *
-                            cur_col]
+                            cur_col] # 8*(c-16): 8*c x H2
         b_L = L[cb.codesz * (cur_col - buf_size):cb.codesz *
-                cur_col].contiguous()
+                cur_col].contiguous() # 8*(c-16):8*c x H, input
         b_prod = prod_cache[cb.codesz * (cur_col - buf_size):cb.codesz *
-                            cur_col]
-        b_Qidxs_T = Qidxs_T[cur_col - buf_size:cur_col]
-        L_offset = cb.codesz * (cur_col - buf_size)
-        for i in reversed(range(buf_size)):
+                            cur_col] # 8*(c-16):8*c x H2
+        b_Qidxs_T = Qidxs_T[cur_col - buf_size:cur_col] # c-16:c x H2
+        L_offset = cb.codesz * (cur_col - buf_size) # block left column offset
+        for i in reversed(range(buf_size)): # 15~0, within the block, back to front cols (compute reversely to the paper)
             WXWX = b_Wr_T[cb.codesz * i : cb.codesz * (i + 1)] + \
                 b_L[cb.codesz * (i + 1):, L_offset + cb.codesz * i : L_offset + cb.codesz * (i + 1)].T @ \
                 (b_Wr_T[cb.codesz * (i + 1):] - b_hatWr_T[cb.codesz * (i + 1):]) + \
-                b_prod[cb.codesz * i : cb.codesz * (i + 1)]
-            q_out = cb.quantize(WXWX.T,
+                b_prod[cb.codesz * i : cb.codesz * (i + 1)] # Wk(gxm) + Ak,k+1(gxgr) x [Wk+1(grxm)-W'k+1(grxm)] + Ak,k+1: x [Wk+1,:-W'k+1,:], r means remaining cols in cache block 128
+            q_out = cb.quantize(WXWX.T, # mxg
                                 resid_scale_override=args.resid_scale_override)
             b_hatWr_T[cb.codesz * i:cb.codesz * (i + 1)] = q_out[0].T
             b_Qidxs_T[i] = q_out[1]
@@ -225,16 +225,16 @@ def LDLQ_buffered(Wr, Hr, L, D, cb, args, buf_cols=128):
     for ie in range(args.quip_tune_iters):
         # recompute delta to minimize errors
         delta_T = Wr_T - hatWr_T
-        for cur_col in range(n // cb.codesz, 0, -buf_size):
+        for cur_col in range(n // cb.codesz, 0, -buf_size): # for all buffers
             b_hatWr_T = hatWr_T[cb.codesz * (cur_col - buf_size):cb.codesz *
-                                cur_col]
-            b_Hr_T = Hr_T[cb.codesz * (cur_col - buf_size):cb.codesz * cur_col]
+                                cur_col] # bufxm
+            b_Hr_T = Hr_T[cb.codesz * (cur_col - buf_size):cb.codesz * cur_col] # bufxn
             b_delta_T = delta_T[cb.codesz * (cur_col - buf_size):cb.codesz *
-                                cur_col]
-            b_Qidxs_T = Qidxs_T[cur_col - buf_size:cur_col]
-            Hr_offset = cb.codesz * (cur_col - buf_size)
-            for i in reversed(range(buf_size)):
-                if cb.codesz > 1:
+                                cur_col] # bufxm
+            b_Qidxs_T = Qidxs_T[cur_col - buf_size:cur_col] # buf/8xm
+            Hr_offset = cb.codesz * (cur_col - buf_size) # 8 * (cur - 16)
+            for i in reversed(range(buf_size)): # within each buffer in a total of 16, for all block
+                if cb.codesz > 1: # W'k(8xm) + Inv(Hk,k(8x8)) @ Hk,:(8xn) @ (W-W')(nxm)
                     WXWX = b_hatWr_T[cb.codesz * i : cb.codesz * (i + 1)] + \
                         torch.linalg.inv(b_Hr_T[cb.codesz * i : cb.codesz * (i + 1), Hr_offset + cb.codesz * i : Hr_offset + cb.codesz * (i + 1)].T).T @ b_Hr_T[cb.codesz * i : cb.codesz * (i + 1)] @ delta_T
                 else:
@@ -242,10 +242,10 @@ def LDLQ_buffered(Wr, Hr, L, D, cb, args, buf_cols=128):
                         (1/b_Hr_T[i, Hr_offset + i]) * b_Hr_T[cb.codesz * i : cb.codesz * (i + 1)] @ delta_T
                 b_delta_T[cb.codesz * i:cb.codesz *
                           (i + 1)] += b_hatWr_T[cb.codesz * i:cb.codesz *
-                                                (i + 1)]
+                                                (i + 1)] # fully recover the processed deltak to Wk
 
                 if ie < args.quip_tune_iters - 1:
-                    b_hatWr_T[cb.codesz * i:cb.codesz * (i + 1)] = cb.quantize(
+                    b_hatWr_T[cb.codesz * i:cb.codesz * (i + 1)] = cb.quantize( # quantize based on better WXWX approx, 8xm
                         WXWX.T,
                         return_idx=False,
                         resid_scale_override=args.resid_scale_override).T
@@ -253,11 +253,11 @@ def LDLQ_buffered(Wr, Hr, L, D, cb, args, buf_cols=128):
                     q_out = cb.quantize(
                         WXWX.T, resid_scale_override=args.resid_scale_override)
                     b_hatWr_T[cb.codesz * i:cb.codesz * (i + 1)] = q_out[0].T
-                    b_Qidxs_T[i] = q_out[1]
+                    b_Qidxs_T[i] = q_out[1] # for the last iter, update the idx
 
                 b_delta_T[cb.codesz * i:cb.codesz *
                           (i + 1)] -= b_hatWr_T[cb.codesz * i:cb.codesz *
-                                                (i + 1)]
+                                                (i + 1)] # update b_delta to newly quantized one
             hatWr_T[cb.codesz * (cur_col - buf_size):cb.codesz *
                     cur_col] = b_hatWr_T
             Qidxs_T[cur_col - buf_size:cur_col] = b_Qidxs_T
@@ -265,7 +265,7 @@ def LDLQ_buffered(Wr, Hr, L, D, cb, args, buf_cols=128):
         del delta_T, b_hatWr_T, b_Hr_T, b_delta_T, b_Qidxs_T, Hr_offset
         utils.clean()
 
-    return hatWr_T.T.contiguous(), Qidxs_T.T.contiguous()
+    return hatWr_T.T.contiguous(), Qidxs_T.T.contiguous() # mxn, m
 
 
 def LDLQ_buffered_lowmem(Wr, Hr, L, D, cb, args, buf_cols=128):
@@ -381,7 +381,7 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
         utils.clean()
         return quantize(H_orig, W_orig, rank, codebook_orig, new_args, device)
 
-    Lhr, Hr, Wr, SU, SV, scaleWH = incoh_out
+    Lhr, Hr, Wr, SU, SV, scaleWH = incoh_out # HxH, HxH, HxH2, H, H2, H or None
     del incoh_out
     utils.clean()
 
@@ -417,7 +417,7 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
     # LDLQ
     Wscale = Wr.square().mean().sqrt()
     if args.scale_override > 0:
-        Wscale /= args.scale_override
+        Wscale /= args.scale_override # 0.9
     else:
         Wscale /= codebook.opt_scale
     Wr = Wr / Wscale
@@ -441,14 +441,14 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
                                      args,
                                      buf_cols=128)
 
-    Wr = Wr.cpu()
+    Wr = Wr.cpu() # just clean up
     Hr = Hr.cpu()
     L = L.cpu()
     D = D.cpu()
     del Wr, Hr, L, D
     utils.clean()
 
-    hatWr = hatWr * Wscale
+    hatWr = hatWr * Wscale # 1/0.9
 
     # low rank correction
     if args.lora_rank > 0:
@@ -461,7 +461,7 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
     # reverse incoherence process
     hatW = incoherence_process(hatWr, SU, SV, scaleWH, args)
 
-    Qidxs = codebook.maybe_pack_idxs(Qidxs)
+    Qidxs = codebook.maybe_pack_idxs(Qidxs) # 16bit -> 64 bit mxn/8/4
 
     attr = {
         'Qidxs': Qidxs.to(orig_device),
@@ -479,23 +479,23 @@ def quantize(H_orig, W_orig, rank, codebook_orig, args, device='cpu'):
 
 
 def quantize_linear(weights, save_path, hessian_path, cb, args, device='cpu'):
-    dtype_ = torch.float64 if args.use_fp64 else torch.float32
+    dtype_ = torch.float64 if args.use_fp64 else torch.float32 # float32
 
     shapes = [_.shape for _ in weights]
-    scales = [_.to(dtype_).square().mean().sqrt() for _ in weights]
+    scales = [_.to(dtype_).square().mean().sqrt() for _ in weights] # norm value
 
     if os.path.exists(save_path):
         return
 
-    H_data = torch.load(hessian_path, map_location=torch.device('cpu'))
-    H = utils.flat_to_sym(H_data['flatH'], H_data['n'])
+    H_data = torch.load(hessian_path, map_location=torch.device('cpu')) # flatH H*(H+1)/2, ct=BH=6144*4096
+    H = utils.flat_to_sym(H_data['flatH'], H_data['n']) # n=4096
     mu = H_data['mu']
-    H.add_(mu[None, :] * mu[:, None])
+    H.add_(mu[None, :] * mu[:, None]) # substracted before store, why??
     n = H_data['n']
     W = torch.vstack([
-        weights[i].to(dtype_) / scales[i] for i in range(len(weights))
+        weights[i].to(dtype_) / scales[i] for i in range(len(weights)) # regularize W 12288x4096
     ]).to(dtype_)
-    H = utils.regularize_H(H, n, args.sigma_reg)
+    H = utils.regularize_H(H, n, args.sigma_reg) # 0.01, H / torch.diag(H).mean() + sigma_reg * torch.eye(n, device=H.device)
     hatW, attr = quantize(H, W, args.lora_rank, cb, args, device)
     if len(scales) == 1:
         # fuse single scale into SV too
@@ -507,5 +507,5 @@ def quantize_linear(weights, save_path, hessian_path, cb, args, device='cpu'):
         'scales': scales,
     })
     torch.save(attr, save_path)
-    utils.show_metrics(hatW, W, H.to(dtype_), save_path)
+    utils.show_metrics(hatW, W, H.to(dtype_), save_path) # frobius norm, proxy error
     utils.clean()

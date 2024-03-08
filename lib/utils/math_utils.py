@@ -14,15 +14,15 @@ def flat_to_sym(V, N):
 def block_LDL(H, b, check_nan=True):
     n = H.shape[0]
     assert (n % b == 0)
-    m = n // b
+    m = n // b # 512
     try:
         L = torch.linalg.cholesky(H)
     except:
         return None
-    DL = torch.diagonal(L.reshape(m, b, m, b), dim1=0, dim2=2).permute(2, 0, 1)
-    D = (DL @ DL.permute(0, 2, 1)).cpu()
+    DL = torch.diagonal(L.reshape(m, b, m, b), dim1=0, dim2=2).permute(2, 0, 1) # treat as mxm grid with bxb block, give m x bxb diagonal blocks
+    D = (DL @ DL.permute(0, 2, 1)).cpu() # mxbxb, mxbxb
     DL = torch.linalg.inv(DL)
-    L = L.view(n, m, b)
+    L = L.view(n, m, b) # mbxmxb
     for i in range(m):
         L[:, i, :] = L[:, i, :] @ DL[i, :, :]
 
@@ -30,7 +30,7 @@ def block_LDL(H, b, check_nan=True):
         return None
 
     L = L.reshape(n, n)
-    return (L, D.to(DL.device))
+    return (L, D.to(DL.device)) # mbxmb, mxbxb
 
 
 def approx_int_sqrt(n):

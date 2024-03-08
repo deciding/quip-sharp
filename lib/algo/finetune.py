@@ -68,15 +68,15 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
     torch.manual_seed(idx)
     torch.set_num_threads(args.num_cpu_threads)
 
-    codebook_id = codebook.get_id(args.codebook)
+    codebook_id = codebook.get_id(args.codebook) # E8P12: 7
 
     mixed_layer = mixed_layer.float()
 
-    train_dl, valid_dl = utils.split_data(pre_orig_emb, orig_emb, args)
+    train_dl, valid_dl = utils.split_data(pre_orig_emb, orig_emb, args) # 256 train 128 val
 
     shared_args = (cb.codesz, cb.packsz, cb.pack_out, str(cb.idx_dtype),
                    cb.version)
-    shared_kwargs = {
+    shared_kwargs = { # almost all disabled
         'rank': args.lora_rank,
         'rescale_WH': args.rescale_WH,
         'resid_scale_override': args.resid_scale_override,
@@ -85,9 +85,9 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
         'grad_ckpt': args.ft_grad_ckpt,
     }
 
-    for quant_i, (linear_attr, name) in enumerate(quant_order):
+    for quant_i, (linear_attr, name) in enumerate(quant_order): # e.g. self_attn.qkv_proj, qkv
         orig_linear = attrgetter(linear_attr)(mixed_layer)
-        if orig_linear.bias is not None:
+        if orig_linear.bias is not None: # TODO: now must be without bias
             # not implemented yet
             raise Exception
         save_path = f'{args.save_path}/{idx}_{name}.pt'
@@ -126,13 +126,13 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
             attrgetter('.'.join(split_attr[:-1]))(mixed_layer), split_attr[-1],
             quant_linear)
         if quant_i < len(quant_order) - 1:
-            finetune_decoder_layer(mixed_layer, f'{idx}_{name}', device,
+            finetune_decoder_layer(mixed_layer, f'{idx}_{name}', device, # finetune params as well as su sv, but with different lr
                                    train_dl, valid_dl, args)
 
     with torch.no_grad():
         utils.clean()
         for i, (linear_attr, name) in enumerate(quant_order):
-            utils.save_susv(
+            utils.save_susv( # save all including su sv
                 attrgetter(linear_attr)(mixed_layer),
                 f'{args.save_path}/{idx}_{name}.pt')
 

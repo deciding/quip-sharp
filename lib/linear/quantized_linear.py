@@ -14,12 +14,12 @@ class QuantizedLinear(nn.Module):
         self,
         in_features,
         out_features,
-        codesz,
-        packsz,
+        codesz, # 4
+        packsz, # 8
         pack_out,
         idx_dtype,
         codebook_version,
-        rank=-1,
+        rank=-1, # lora rank
         rescale_WH=False,
         bias=False,
         resid_scale_override=-1,
@@ -38,7 +38,7 @@ class QuantizedLinear(nn.Module):
         if self.has_bias:
             self.register_buffer('bias', torch.ones(out_features))
 
-        if self.rank > 0:
+        if self.rank > 0: # lora rank
             self.register_buffer('A', torch.zeros(out_features, rank))
             self.register_buffer('B', torch.zeros(rank, in_features))
         else:
@@ -51,7 +51,7 @@ class QuantizedLinear(nn.Module):
             self.scaleWH = None
 
         # direction we pack in, the code dimension is always in the in dimension
-        if pack_out:
+        if pack_out: # Nope
             self.register_buffer(
                 "Qidxs",
                 torch.zeros(int(out_features / packsz),
@@ -65,29 +65,29 @@ class QuantizedLinear(nn.Module):
                             dtype=dtype_from_str(idx_dtype)))
 
         self.register_buffer("codebook_id", torch.tensor(0))
-        self.register_buffer("SU", torch.ones(in_features,
+        self.register_buffer("SU", torch.ones(in_features, # only need to have diagonal
                                               dtype=torch.float16))
         self.register_buffer("SV", torch.ones(out_features,
                                               dtype=torch.float16))
-        self.register_buffer("Wscale", torch.ones(()))
+        self.register_buffer("Wscale", torch.ones(())) # scalar 1.0
 
         self.built_codebook_class = False
         self.built_graph = False
         self.codebook_version = codebook_version
 
-        had_left, K_left = get_hadK(in_features)
-        had_right, K_right = get_hadK(out_features)
+        had_left, K_left = get_hadK(in_features) # 11008 -> 172x172, 172, only for cases that are not power of 2, additional multiplication matrix
+        had_right, K_right = get_hadK(out_features) # 4096 -> None, 1
         self.register_buffer('had_left', had_left, persistent=False)
         self.register_buffer('had_right', had_right, persistent=False)
-        self.K_left = K_left
+        self.K_left = K_left # VSvHSvVt, USuWSvVt
         self.K_right = K_right
-        self.packed = (packsz != 1)
-        self.train_mode = train_mode
-        self.grad_ckpt = grad_ckpt
+        self.packed = (packsz != 1) # True
+        self.train_mode = train_mode # False
+        self.grad_ckpt = grad_ckpt # False
 
     def forward(self, input):
-        if self.grad_ckpt:
-            return self.ckpt_forward(input)
+        if self.grad_ckpt: # False
+            return self.ckpt_forward(input) # direct
         return self.no_ckpt_forward(input)
 
     def ckpt_forward(self, input):

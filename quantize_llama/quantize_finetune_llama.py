@@ -67,7 +67,7 @@ def check_exist(idx, args):
     return True
 
 
-def quantize_llama_layer(layer, idx, cb, args, device, pre_orig_emb, orig_emb,
+def quantize_llama_layer(layer, idx, cb, args, device, pre_orig_emb, orig_emb, # BxLxH
                          model_config):
     if check_exist(idx, args):
         return
@@ -79,10 +79,10 @@ def quantize_llama_layer(layer, idx, cb, args, device, pre_orig_emb, orig_emb,
             layer.self_attn.v_proj.weight
         ]
 
-        fused_qkv_proj = FusedLinear(-1, [_.shape[0] for _ in weights],
-                                     weights[0].shape[1],
-                                     sum([_.shape[0] for _ in weights]),
-                                     bias=False)
+        fused_qkv_proj = FusedLinear(-1, [_.shape[0] for _ in weights], # fuse_dim=-1, fuse_sizes=[H,H,H]
+                                     weights[0].shape[1], # H2
+                                     sum([_.shape[0] for _ in weights]), # 3H
+                                     bias=False) # fuse QKV
         cur = 0
         for w in weights:
             fused_qkv_proj.weight[cur:cur + w.shape[0]].copy_(w)
@@ -130,7 +130,7 @@ def quantize_llama_layer(layer, idx, cb, args, device, pre_orig_emb, orig_emb,
 def main(args):
     dtype_ = torch.float64 if args.use_fp64 else torch.float32
 
-    cb = codebook.get_codebook(args.codebook)
+    cb = codebook.get_codebook(args.codebook) # E8P12
 
     model = AutoModelForCausalLM.from_pretrained(args.base_model,
                                                  torch_dtype='auto',
@@ -140,13 +140,13 @@ def main(args):
     all_config = {'quant_args': args, 'model_config': model.config}
     quip_params = {
         'lora_rank': args.lora_rank,
-        'rescale_WH': args.rescale_WH,
-        'codebook': args.codebook,
+        'rescale_WH': args.rescale_WH, # False
+        'codebook': args.codebook, # E8P12
         'codebook_version': cb.version,
-        'codesz': cb.codesz,
-        'idx_dtype': str(cb.idx_dtype),
-        'packsz': cb.packsz,
-        'resid_scale_override': args.resid_scale_override,
+        'codesz': cb.codesz, # 8
+        'idx_dtype': str(cb.idx_dtype), # int64
+        'packsz': cb.packsz, # 4
+        'resid_scale_override': args.resid_scale_override, # -1
     }
     all_config['model_config'].update({'quip_params': quip_params})
     torch.save(all_config, os.path.join(args.save_path, 'config.pt'))
@@ -156,32 +156,32 @@ def main(args):
     glog.info('loaded model')
 
     devset = utils.sample_rp1t(tokenizer, args.devset_size, args.ctx_size,
-                               args.sample_proc)
+                               args.sample_proc) # B x L
     glog.info('loaded dataset and devset')
 
     nproc = torch.cuda.device_count()
     orig_emb_cache = [model.model.embed_tokens(devset)]
     for _ in range(nproc):
-        orig_emb_cache.append(
-            torch.zeros(orig_emb_cache[0].shape,
-                        dtype=orig_emb_cache[0].dtype,
+        orig_emb_cache.append( # 
+            torch.zeros(orig_emb_cache[0].shape, # BxLxH
+                        dtype=orig_emb_cache[0].dtype, # fp16
                         device=orig_emb_cache[0].device))
 
     position_ids = torch.arange(args.ctx_size, dtype=torch.int32)[None, :] + \
-        torch.zeros(args.batch_size, args.ctx_size, dtype=torch.int32)
-    attention_mask = _prepare_4d_causal_attention_mask(
+        torch.zeros(args.batch_size, args.ctx_size, dtype=torch.int32) # bxL arange
+    attention_mask = _prepare_4d_causal_attention_mask( # bx1xLxL upper triangular big neg
         None, (args.batch_size, args.ctx_size),
         orig_emb_cache[0][:args.batch_size], 0)
 
     cur_device = 0
     proc_list = [None for _ in range(nproc)]
-    for i in range(len(model.model.layers)):
+    for i in range(len(model.model.layers)): # cur_device for round robin, finetune one layer, quantize it, then next layer
         glog.info(f'layer {i} gpu {cur_device}')
         if proc_list[cur_device] is not None:
             proc_list[cur_device].join()
             if cur_device == 0:
-                orig_emb_cache[0].copy_(orig_emb_cache[-1])
-        if cur_device + 1 < nproc and proc_list[cur_device + 1] is not None:
+                orig_emb_cache[0].copy_(orig_emb_cache[-1]) # copy src: orig[-1], the first one is emb, other ngpus are 0s
+        if cur_device + 1 < nproc and proc_list[cur_device + 1] is not None: # recycle for next round
             proc_list[cur_device + 1].join()
         utils.clean()
 
@@ -190,7 +190,7 @@ def main(args):
             position_ids = position_ids.to(cur_device)
             attention_mask = attention_mask.to(cur_device)
             model.model.layers[i].to(cur_device)
-            for j in range(args.devset_size // args.batch_size):
+            for j in range(args.devset_size // args.batch_size): # update emb_cache for next layer for all devset
                 orig_emb_cache[cur_device + 1][
                     args.batch_size * j : args.batch_size * (j + 1)] = \
                     model.model.layers[i](
@@ -207,12 +207,21 @@ def main(args):
             )**2 / orig_emb_cache[cur_device + 1].numel()
             position_ids = position_ids.cpu()
             attention_mask = attention_mask.cpu()
-            utils.clean()
+            utils.clean() # calculated mean squared value for cur and next layer
             glog.info(
                 'computed original embedding for layer {} in {}s, pre msv {}, post msv {}'
                 .format(i,
                         time.time() - st, orig_msv, target_msv))
 
+        #quantize_llama_layer(model.model.layers[i],
+        #                                       i,
+        #                                       cb,
+        #                                       args,
+        #                                       cur_device,
+        #                                       orig_emb_cache[cur_device], # X
+        #                                       orig_emb_cache[cur_device + 1], # Y
+        #                                       all_config['model_config'],
+        #                     )
         proc_list[cur_device] = mp.Process(target=quantize_llama_layer,
                                            args=(
                                                model.model.layers[i],
@@ -220,8 +229,8 @@ def main(args):
                                                cb,
                                                args,
                                                cur_device,
-                                               orig_emb_cache[cur_device],
-                                               orig_emb_cache[cur_device + 1],
+                                               orig_emb_cache[cur_device], # X
+                                               orig_emb_cache[cur_device + 1], # Y
                                                all_config['model_config'],
                                            ))
         proc_list[cur_device].start()
